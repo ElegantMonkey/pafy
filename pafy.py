@@ -40,31 +40,29 @@ else:
 
 #logging.basicConfig(level=logging.DEBUG)
 
-def _extract_function_from_js(funcname, js):
-    # Find a function definition named funcname and extract components
-    match = re.search(r'function %s\(((?:\w+,?)+)\)\{([^\{]+)\}' % funcname, js)
-    return {'name': funcname, 'argnames': match.group(1).split(","),
-        'body': match.group(2) }
+def _extract_function_from_js(name, js):
+    # Find a function called `name` and extract components
+    m = re.search(r'function %s\(((?:\w+,?)+)\)\{([^\{]+)\}' % name, js)
+    return {'name': name, 'parameters': m.group(1).split(","),
+        'body': m.group(2) }
 
 def _getval(val, argsdict): # resolves variable values. preserves int literals
-    match = re.match(r'(\d+)', val)
-    if match:
-        return(int(match.group(1)))
+    m = re.match(r'(\d+)', val)
+    if m:
+        return(int(m.group(1)))
     elif val in argsdict:
         return argsdict[val]
     else:
         raise RuntimeError("Error val %s from dict %s" % (val, argsdict))
 
-def _get_func_from_call(f_old, fname, argscall, js):
-    argscall = argscall.split(",")
-    newfunc = _extract_function_from_js(fname, js)
-    newfunc['args'] = {}
-    for n, argname in enumerate(argscall):
-        value = _getval(argname, f_old['args'])
-        # curvar is the argument name specified in the new function definition
-        curvar = newfunc['argnames'][n]
-        newfunc['args'][curvar] = value
-    return newfunc
+def _get_func_from_call(caller_function, name, arguments, js):
+    newfunction = _extract_function_from_js(name, js)
+    newfunction['args'] = {}
+    for n, arg in enumerate(arguments):
+        value = _getval(arg, caller_function['args'])
+        param = newfunction['parameters'][n]
+        newfunction['args'][param] = value
+    return newfunction
 
 def _solve(f, js):
     # solve basic javascript function
@@ -77,8 +75,8 @@ def _solve(f, js):
             continue
         m = re.match(r'(\w+)=(\w+)\(((?:\w+,?)+)\)', part)
         if m: # a function call
-            lhs, fname, argscall = m.group(*range(1,4))
-            newfunc = _get_func_from_call(f, fname, argscall, js)
+            lhs, funcname, args = m.group(*range(1,4))
+            newfunc = _get_func_from_call(f, funcname, args.split(","), js)
             f['args'][lhs] = _solve(newfunc, js) # recursive call
             continue
         m = re.match(r'var\s(\w+)=(\w+)\[(\w+)\]', part)
@@ -118,10 +116,10 @@ def _decodesig(sig, js):
     match = re.search(r'%s\|\|(\w+)\(%s\)' % (sigprefix, sigargument), js)
     funcname = match.group(1)
     function = _extract_function_from_js(funcname, js)
-    if not len(function['argnames']) == 1:
+    if not len(function['parameters']) == 1:
         raise RuntimeError("Main sig js function has more than one arg: %s" %
-            function['argnames'])
-    function['args'] = {function['argnames'][0]: sig}
+            function['parameters'])
+    function['args'] = {function['parameters'][0]: sig}
     return _solve(function, js)
 
 class Stream():
@@ -156,53 +154,39 @@ class Stream():
         self.itag = streammap['itag'][0]
         self.title = title
         self.filename = self.title + "." + self.extension
+        self.filesize = None
         self._opener = opener
 
     def get_filesize(self):
-        opener = self._opener
-        return int(opener.open(self.url).headers['content-length'])
+        if not self.filesize:
+            opener = self._opener
+            self.filesize = int(opener.open(self.url).headers['content-length'])
+        return self.filesize
 
-    def download_with_callback(self, prepare_callback=None,
-                                     progress_callback=None, filepath=""):
+    def download(self, filepath="", quiet=False, callback=None):
+        status_string = ('  {:,} Bytes [{:.2%}] received. Rate: [{:4.0f} '
+                         'kbps].  ETA: [{:.0f} secs]')
         response = self._opener.open(self.url)
         total = int(response.info()['Content-Length'].strip())
-        if prepare_callback != None:
-            prepare_callback(total)
-        chunksize, bytesdone, t0 = 1024, 0, time.time()
+        chunksize, bytesdone, t0 = 16384, 0, time.time()
         outfh = open(filepath or self.filename, 'wb')
-        while 1:
+        while True:
             chunk = response.read(chunksize)
-            elapsed = time.time() - t0
             outfh.write(chunk)
+            elapsed = time.time() - t0
             bytesdone += len(chunk)
+            rate = (bytesdone / 1024) / elapsed
+            eta = (total - bytesdone) / (rate * 1024)
+            progress_stats = (bytesdone, bytesdone * 1.0 / total, rate, eta)
             if not chunk:
                 outfh.close()
                 break
-            if progress_callback != None:
-                rate = (bytesdone / 1024) / elapsed
-                eta = (total - bytesdone) / (rate * 1024)
-                arguments = (bytesdone, bytesdone * 1.0 / total, rate, eta)
-                progress_callback(*arguments)
-    
-    def download(self, progress=True, filepath=""):
-        def prepare_cb(total):
-            print("Downloading '{}' [{:,}] Bytes".format(self.filename, total))
-        
-        def progress_cb(*args):
-            status_string = ('  {:,} Bytes [{:.2%}] received. Rate: [{:4.0f} '
-                             'kbps].  ETA: [{:.0f} secs]')
-            sys.stdout.write("\r" + status_string.format(*args) + ' ' * 4 + "\r")
-            sys.stdout.flush()
-        
-        if progress:
-            self.download_with_callback(prepare_callback=prepare_cb,
-                                        progress_callback=progress_cb,
-                                        filepath=filepath)
-        else:
-            self.download_with_callback(prepare_callback=prepare_cb,
-                                        progress_callback=None,
-                                        filepath=filepath)
-        print("\nDone")
+            if not quiet:
+                status = status_string.format(*progress_stats)
+                sys.stdout.write("\r" + status + ' ' * 4 + "\r")
+                sys.stdout.flush()
+            if callback:
+                callback(total, *progress_stats)
 
 
 class Pafy():
